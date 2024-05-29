@@ -1,0 +1,7 @@
+ezdxf
+numpy
+Pillow
+tk
+scipy
+scikit-image
+tk
