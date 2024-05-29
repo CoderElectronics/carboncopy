@@ -33,127 +33,27 @@ im_cropped = None
 im_gray, im_bool, im_bin = None, None, None
 im_thresh_s = 128
 
-rect_id = None
-p1_id = None
-p2_id = None
-enabled = False
-
-# Helper FNs
-def previewProc(pathm):
-    global width, height
-    global new_width
-    global input_img
-    input_img = Image.open(pathm)
-    width, height = input_img.size
-    new_width = int((width / height) * 512)
-    prv_img = input_img.resize((new_width, 512))
-
-    return prv_img
-
-# Setup window
-"""window = tk.Tk()
-window.title("Carbon Copy Tool")
-window.geometry('%sx%s' % (500, 512))
-window.minsize(500, 512)
-window.maxsize(500, 512)
-
-img = ImageTk.PhotoImage(previewProc(path))
-canvas = tk.Canvas(window, width=new_width, height=512,
-                   borderwidth=0, highlightthickness=0)
-canvas.grid(column=0, row=0)
-canvas.img = img  # Keep reference in case this code is put into a function.
-img_con = canvas.create_image(0, 0, image=img, anchor=tk.NW)
-
-# Create selection rectangle (invisible since corner points are equal).
-rect_id = canvas.create_rectangle(topx, topy, topx, topy,
-                                  dash=(2,2), fill='', outline='red')
-
-p1_id = canvas.create_oval(p1x-10, p1y-10, p1x+10, p1y+10,
-                                  dash=(2,2), outline="green")
-p2_id = canvas.create_oval(p2x-10, p2y-10, p2x+10, p2y+10,
-                                  dash=(2,2), outline="blue")"""
-
-# Buttons here
-def procDims():
-    clks = [p1x == 0, p1y == 0, p2x == 0, p2y == 0]
-    if botx == topx and boty == topy:
-        messagebox.showwarning("Warning","Please drag and select an area of the image first!")
-    elif True in clks:
-        messagebox.showwarning("Warning","Please select 2 points as known dimensions!")
-    elif re.match(r'^-?\d+(?:\.\d+)$', knownlocpos.get("1.0",END)) is None:
-        messagebox.showwarning("Warning","Enter a valid dimension!")
-    else:
-        xScl = interp1d([0, new_width], [0, width])
-        yScl = interp1d([0, 512],[0, height])
-        proc_img_crop = input_img.crop((int(xScl(topx)), int(yScl(topy)), int(xScl(botx)), int(yScl(boty))))
-
-        adjustmentPanel(proc_img_crop)
-
-def adjustmentPanel(proc_img_crop):
-    global adj_new_width, adj_prv_img
-
-    panel = tk.Toplevel(window)
-    panel.title("Adjust Image Processing Settings")
-    adj_width, adj_height = proc_img_crop.size
-    adj_new_width = int((adj_width / adj_height) * 512)
-    adj_prv_img = proc_img_crop.resize((adj_new_width, 512))
-
-    panel.geometry("{}x{}".format(adj_new_width+200, 512))
-    panel.minsize(adj_new_width+200, 512)
-    panel.maxsize(adj_new_width+200, 512)
-
-    global adj_canvas, adj_img_con, thresh_s
-
-    adj_img = ImageTk.PhotoImage(adj_prv_img)
-    adj_canvas = tk.Canvas(panel, width=adj_new_width, height=512,
-                    borderwidth=0, highlightthickness=0)
-    adj_canvas.grid(row=0, column=0)
-    adj_canvas.img = adj_img  # Keep reference in case this code is put into a function.
-    adj_img_con = adj_canvas.create_image(0, 0, image=adj_img, anchor=tk.NW)
-
-    adj_frame = Frame(panel)
-    adj_frame.grid(row=0, column=1)
-
-    Label(adj_frame, text="Bianarize Threshold").grid(row=0, column=0, padx=25)
-    thresh_s = Scale(adj_frame, from_=0, to=255, orient=HORIZONTAL)
-    thresh_s.grid(row=1, column=0, pady=25, padx=(25, 25))
-    thresh_s.bind("<ButtonRelease-1>", processArgs)
-    thresh_s.set(70)
-
-    processArgs(1)
-
-    previewbtn = Button(adj_frame, text="Continue", command=procDxf)
-    previewbtn.grid(row=2, column=0, sticky="sew", pady=25, padx=25)
-
-"""def processArgs(event):
-    global im_gray, im_bool, im_bin
-    im_gray = np.array(adj_prv_img.convert('L'))
-    im_bool = im_gray > thresh_s.get()
-    im_bin = (im_gray > thresh_s.get()) * 255
-
-    img_updated = ImageTk.PhotoImage(Image.fromarray(np.uint8(im_bin)))
-    adj_canvas.itemconfig(adj_img_con, image=img_updated)
-    adj_canvas.config(width=adj_new_width, height=512)
-    adj_canvas.img = img_updated"""
-
 def procDxf():
-    # s_thresh.get() : threshold
+    global im_gray, im_bool, im_bin, im_thresh_s, in_known_dist, p1x, p1y, p2x, p2y, topx, topy, botx, boty
+
+    # im_thresh_s : threshold
+    # in_known_dist: float mm
     # p1x, p1y, p2x, p2y : known dim values
     # topx, topy, botx, boty : crop values
 
-    xScl = interp1d([0, new_width], [0, width])
-    yScl = interp1d([0, 512],[0, height])
+    print("p1: ({}, {}), p2: ({}, {})".format(p1x, p1y, p2x, p2y))
 
-    planar_dist = float(knownlocpos.get("1.0",END))
-    pixel_dist = math.sqrt((xScl(p2x) - xScl(p1x))**2 + (yScl(p2y) - yScl(p1y))**2)
+    planar_dist = float(in_known_dist)
+    pixel_dist = math.sqrt((p2x - p1x)**2 + (p2y - p1y)**2)
+    print("Planar: {}, Pixel: {}".format(planar_dist, pixel_dist))
     dpp = planar_dist / pixel_dist
 
-    input_crop = input_img.crop((int(xScl(topx)), int(yScl(topy)), int(xScl(botx)), int(yScl(boty))))
-    input_gray = np.array(input_crop.convert('L'))
-    input_bool_inv = im_gray < thresh_s.get()
+    input_gray = np.array(im_cropped.convert('L'))
+    input_bool_inv = im_gray < im_thresh_s
 
     edges = feature.canny(input_bool_inv, sigma=3)
-    w_orig, h_orig = input_crop.size
+    w_orig, h_orig = im_cropped.size
+
     xU_scale = interp1d([0, len(edges[0])], [0, w_orig])
     yU_scale = interp1d([0, len(edges)],[0, h_orig])
 
@@ -192,41 +92,9 @@ def procDxf():
     for item in edgeMx:
         msp.add_line((xU_scale(item[1])*dpp, yU_scale(item[0])*dpp), (xU_scale(item[3])*dpp, yU_scale(item[2])*dpp), dxfattribs={"layer": "MainLayer"})
 
-    f = filedialog.asksaveasfile(mode='w', defaultextension=".txt")
-    if f is None:
-        return
-    fn = f.name
-    f.close()
-
-    doc.saveas(fn)
+    doc.saveas("test.dxf")
     
 # Create Widgets
-"""home_frame = Frame(window)
-home_frame.grid(row=0, column=1)
-
-Label(home_frame, text="Right click on two of crosshairs on the page, and measure the distance (float value)", wraplength=105).grid(row=0, column=1)
-
-Label(home_frame, text="\nDistance in mm:").grid(row=1, column=1)
-
-knownlocpos = tk.Text(home_frame, height=1, width=12)
-knownlocpos.grid(row=2, column=1, pady=25, padx=15)
-
-Label(home_frame, text="Drag to select the area to be profiled then click process to continue.", wraplength=105).grid(row=3, column=1)
-
-endbtn = Button(home_frame, text="Process Image", command=procDims, state=DISABLED)
-endbtn.grid(row=4, column=1, sticky="sew", pady=25, padx=25)
-
-menubar = tk.Menu(window)
-filemenu = tk.Menu(menubar, tearoff=0)
-filemenu.add_command(label="Open", command=openImg)
-menubar.add_cascade(label="File", menu=filemenu)
-window.config(menu=menubar)
-
-# Main Loop
-canvas.bind("<Button-2>", set_pin_loc)
-canvas.bind('<Button-1>', get_mouse_posn)
-canvas.bind('<B1-Motion>', update_sel_rect)
-window.mainloop()"""
 
 @ui.refreshable
 def panel_tweak_binarization():
@@ -282,28 +150,24 @@ def uploader_panel():
             loaded_b64_type = e.type
 
             def mouse_handler(e: events.MouseEventArguments):
-                global topx, topy, botx, boty, btn_r_mode, btn_corner_cntr, btn_area_cntr
+                global p1x, p1y, p2x, p2y, topx, topy, botx, boty, btn_r_mode, btn_corner_cntr, btn_area_cntr
 
                 if e.type == 'mousedown':
                     if btn_r_mode:
                         if btn_corner_cntr:
                             p1x, p1y = e.image_x, e.image_y
-
                             ii.content += f'<circle cx="{p1x}" cy="{p1y}" r="10" fill="none" stroke="orange" stroke-width="4" />'
                         else:
                             p2x, p2y = e.image_x, e.image_y
-
                             ii.content += f'<circle cx="{p2x}" cy="{p2y}" r="10" fill="none" stroke="blue" stroke-width="4" />'
 
                         btn_corner_cntr = not btn_corner_cntr
                     else:
                         if btn_area_cntr:
                             topx, topy = e.image_x, e.image_y
-
                             ii.content = f'<circle cx="{topx}" cy="{topy}" r="5" fill="none" stroke="red" stroke-width="2" />'
                         else:
                             botx, boty = e.image_x, e.image_y
-
                             ii.content += f'<circle cx="{botx}" cy="{boty}" r="5" fill="none" stroke="green" stroke-width="2" />'
                             ii.content += f'<rect x="{topx}" y="{topy}" width="{botx-topx}" height="{boty-topy}" style="fill:yellow;stroke:red;stroke-width:3;opacity:0.2" rx="0" ry="0" fill="none" stroke="red" stroke-width="2" />'
 
@@ -371,6 +235,7 @@ def tweak_algorithm_panel():
         with ui.row().classes('w-full'):
             def proc_image_step():
                 # stuff here
+                procDxf()
 
                 ui.notify('Processed image successfully, going to next tab.', type='success')
                 Timer(1, lambda: panels.set_value('Export')).start()
