@@ -5,3 +5,5 @@ tk
 scipy
 scikit-image
 tk
+nicegui
+matplotlib
