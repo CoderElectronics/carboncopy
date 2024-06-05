@@ -4,18 +4,30 @@ Carbon Copy by Ari Stehney
 Scan in carbon pieces to a DXF file.
 """
 
-from concurrent.futures import process
 from PIL import Image
-from scipy.interpolate import interp1d
-import numpy as np
-import math, re, ezdxf, sys
-from scipy import ndimage as ndi
-from skimage import feature
 from nicegui import ui, events
-import io, base64
+import io, base64, math, re, sys, os
 
+from skimage.morphology import convex_hull_image
+from skimage.util import invert
+from skimage import feature
+from skimage.filters import gaussian
+from skimage.segmentation import active_contour
+from skimage.filters import threshold_otsu
+import skimage
+
+from scipy import ndimage
+import matplotlib.pyplot as plt
+from PIL import Image
+import numpy as np
+
+import ezdxf
+from ezdxf.addons.drawing.properties import LayoutProperties
+from ezdxf.addons.drawing import RenderContext, Frontend
+from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+
+import timeit
 from threading import Timer
-from fastapi.responses import StreamingResponse
 
 # Fix recursion overflow errors
 sys.setrecursionlimit(32768)
@@ -29,70 +41,148 @@ btn_r_mode = False
 in_known_dist = 0
 
 loaded_b64, loaded_rgba, loaded_b64_type = None, None, None
-im_cropped = None
-im_gray, im_bool, im_bin = None, None, None
+im_cropped, im_bin, im_final = None, None, None
+doc_buf = None
 im_thresh_s = 128
 
+im_poly_alpha = 0.03
+im_poly_beta = 0.25
+im_poly_gamma = 0.035
+im_poly_scalar = 1
+im_poly_gauss_sigma = 3
+
+def regressive_polyimg_to_dxf_multi_spline(img, msp, poly_scalar=1, s_foreground_thresh=160, alpha=0.05, beta=15,
+                                           gamma=0.035, gaussian_sigma=3, preview=False, pass_bool=None, dppi=1):
+    im_gray = np.array(img.convert('L'))
+    im_gray_thresh = im_gray.copy()
+    im_gray_thresh[im_gray_thresh < s_foreground_thresh] = 0
+    im_bool = im_gray < s_foreground_thresh
+
+    if pass_bool is not None:
+        im_bool = pass_bool
+
+    im_bin = im_bool.astype(np.uint8)
+
+    labels, num = skimage.morphology.label(im_bin, background=None, return_num=True, connectivity=2)
+
+    splinelst = []
+
+    for l_num in range(1, num + 1):
+        tr_arr = (labels == l_num) * 1.
+        tr_bool = np.invert(ndimage.binary_fill_holes(labels == l_num))
+
+        convimg = convex_hull_image(tr_arr)
+        cent_pt = ndimage.measurements.center_of_mass(tr_arr)
+        cent_conv_pt = np.array(ndimage.measurements.center_of_mass(convimg))
+
+        edges = feature.canny(convimg, sigma=gaussian_sigma)
+
+        indices = np.where(edges == [1])
+        coordinates = [list(a) for a in zip(indices[0], indices[1])]
+        coordinates.sort(key=lambda p: math.atan2(p[1] - cent_pt[1], p[0] - cent_pt[0]))
+
+        init = (coordinates - cent_conv_pt) * poly_scalar + cent_conv_pt
+
+        snake = active_contour(
+            gaussian(im_gray_thresh, sigma=gaussian_sigma, preserve_range=False),
+            init,
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma,
+        )
+
+        tr_inside = tr_arr.copy()
+        tr_inside[tr_bool] = invert(tr_inside[tr_bool])
+        tr_inside = invert(tr_inside)
+
+        if preview:
+            fig, ax = plt.subplots(1, 2, figsize=(16, 8))
+
+            ax[1].imshow(tr_inside, cmap=plt.cm.gray)
+
+            ax[0].imshow(im_bin, cmap=plt.cm.gray)
+            ax[0].plot(init[:, 1], init[:, 0], '--r', lw=3)
+            ax[0].plot(snake[:, 1], snake[:, 0], '-b', lw=3)
+            ax[0].scatter([cent_pt[1]], [cent_pt[0]])
+            ax[0].set_xticks([]), ax[0].set_yticks([])
+            ax[0].axis([0, im_gray_thresh.shape[1], im_gray_thresh.shape[0], 0])
+
+            plt.show()
+
+        fit_points = [(ptt[1]*dppi, ptt[0]*dppi, 0) for ptt in snake] + [(snake[0][1]*dppi, snake[0][0]*dppi, 0)]
+        splinelst.append(msp.add_spline(fit_points))
+
+        regressive_polyimg_to_dxf_multi_spline(img, msp,
+                                               poly_scalar=poly_scalar,
+                                               s_foreground_thresh=s_foreground_thresh,
+                                               alpha=alpha,
+                                               beta=beta,
+                                               gamma=gamma,
+                                               gaussian_sigma=gaussian_sigma,
+                                               preview=preview,
+                                               pass_bool=tr_inside.astype(bool),
+                                               dppi=dppi)
+
+    return splinelst
+
 def procDxf():
-    global im_gray, im_bool, im_bin, im_thresh_s, in_known_dist, p1x, p1y, p2x, p2y, topx, topy, botx, boty
+    global im_cropped, im_bin, im_thresh_s, in_known_dist, p1x, p1y, p2x, p2y, topx, topy, botx, boty, im_final, doc_buf
 
     # im_thresh_s : threshold
     # in_known_dist: float mm
     # p1x, p1y, p2x, p2y : known dim values
     # topx, topy, botx, boty : crop values
 
-    print("p1: ({}, {}), p2: ({}, {})".format(p1x, p1y, p2x, p2y))
+    #print("p1: ({}, {}), p2: ({}, {})".format(p1x, p1y, p2x, p2y))
 
     planar_dist = float(in_known_dist)
     pixel_dist = math.sqrt((p2x - p1x)**2 + (p2y - p1y)**2)
-    print("Planar: {}, Pixel: {}".format(planar_dist, pixel_dist))
     dpp = planar_dist / pixel_dist
 
-    input_gray = np.array(im_cropped.convert('L'))
-    input_bool_inv = im_gray < im_thresh_s
+    #print("planar: {}, pixel: {}, dpp: {}".format(planar_dist, pixel_dist, dpp))
 
-    edges = feature.canny(input_bool_inv, sigma=3)
-    w_orig, h_orig = im_cropped.size
-
-    xU_scale = interp1d([0, len(edges[0])], [0, w_orig])
-    yU_scale = interp1d([0, len(edges)],[0, h_orig])
-
-    addPt = []
-    edgeMx = []
-    def procEdge(i, j):
-        edgematrix = [
-            [i+1, j+1],
-            [i+1, j],
-            [i, j+1],
-            [i-1, j-1],
-            [i-1, j],
-            [i, j-1],
-            [i-1, j+1],
-            [i+1, j-1],
-        ]
-
-        for k in edgematrix:
-            if (edges[k[0], k[1]] == 1) and (not (k in addPt)):
-                addPt.append([k[0], k[1]])
-                edgeMx.append([i, j, k[0], k[1]])
-                try:
-                    procEdge(k[0], k[1])
-                except RecursionError:
-                    messagebox.showwarning("Warning","Please increase recursion depth!")
-                    return
-
-    for j in range(0, len(edges[0])-1):
-        for i in range(0, len(edges)-1):
-            if edges[i, j]==1 and (not ([i, j] in addPt)):
-                procEdge(i, j)
+    #print("alpha: {}, beta: {}, gamma: {}, gaussian_sigma: {}, poly_scalar: {}".format(im_poly_alpha, im_poly_beta, im_poly_gamma, im_poly_gauss_sigma, im_poly_scalar))
 
     doc = ezdxf.new(setup=True)
     msp = doc.modelspace()
 
-    for item in edgeMx:
-        msp.add_line((xU_scale(item[1])*dpp, yU_scale(item[0])*dpp), (xU_scale(item[3])*dpp, yU_scale(item[2])*dpp), dxfattribs={"layer": "MainLayer"})
+    splist = regressive_polyimg_to_dxf_multi_spline(im_cropped, msp,
+                                                    poly_scalar=im_poly_scalar,
+                                                    s_foreground_thresh=im_thresh_s,
+                                                    alpha=im_poly_alpha, # 0.03
+                                                    beta=im_poly_beta, # 0.25
+                                                    gamma=im_poly_gamma, # 0.035
+                                                    gaussian_sigma=im_poly_gauss_sigma,
+                                                    preview=False,
+                                                    dppi=dpp)
 
-    doc.saveas("test.dxf")
+    ctx = RenderContext(doc)
+    msp_properties = LayoutProperties.from_layout(msp)
+    msp_properties.set_colors("#eaeaea")
+
+    fig = plt.figure()
+    ax = fig.add_axes((0, 0, 1, 1))
+    out = MatplotlibBackend(ax)
+
+    # override the layout properties and render the modelspace
+    Frontend(ctx, out).draw_layout(
+        msp,
+        finalize=True,
+        layout_properties=msp_properties,
+    )
+
+    # cache image for GUI
+    img_buf = io.BytesIO()
+    fig.savefig(img_buf, format='png')
+    im_final = Image.open(img_buf)
+
+    # cache DXF for download
+    doc.saveas("cache.dxf")
+
+    with open("cache.dxf", "rb") as fh:
+        doc_buf = fh.read()
+
+    os.remove("cache.dxf")
     
 # Create Widgets
 
@@ -111,7 +201,7 @@ def panel_tweak_binarization():
         ui.image(img_updated).props('fit=scale-down')
 
     ui.label('Binarization').classes('text-h4')
-    ui.label('Tweak the threshold below until only the object is shown, and it is completely solid without gaps.')
+    ui.label('Tweak the threshold below until only the object is shown and completely solid without gaps. Increasing the threshold may cause the volume to be larger than the original.')
 
     binarImage()
 
@@ -127,16 +217,49 @@ def panel_tweak_binarization():
     ui.run()
 
 @ui.refreshable
-def panel_tweak_lcom():
-    ui.label('LCOM Reduction').classes('text-h4')
-    ui.label('Local center of mass size')
+def panel_tweak_polyreg():
+    global im_poly_alpha, im_poly_beta, im_poly_gamma, im_poly_scalar, im_poly_gauss_sigma
 
-@ui.refreshable
-def panel_tweak_tangvec():
-    ui.label('Tangency/Vectorization').classes('text-h4')
-    ui.label('Spline conversion parameters')
+    def update_poly_params(param, thr):
+        globals()[param] = thr
+
+    ui.label('Polygon Regression').classes('text-h4')
+    ui.label('Modify the parameters to tune the shape fitting algorithm, higher values may result in perimeter overfitting or strange issues.')
+
+    with ui.column():
+        with ui.row():
+            ui.number(label='Alpha', value=im_poly_alpha, format='%.4f',
+                      on_change=lambda e: update_poly_params('im_poly_alpha', e.value))
+
+            ui.number(label='Beta', value=im_poly_beta, format='%.4f',
+                      on_change=lambda e: update_poly_params('im_poly_beta', e.value))
+
+            ui.number(label='Gamma', value=im_poly_gamma, format='%.4f',
+                      on_change=lambda e: update_poly_params('im_poly_gamma', e.value))
+
+            ui.number(label='Gaussian sigma', value=im_poly_gauss_sigma, format='%i',
+                      on_change=lambda e: update_poly_params('im_poly_gauss_sigma', e.value))
+
+            ui.number(label='Polygon scalar', value=im_poly_scalar, format='%.2f',
+                      on_change=lambda e: update_poly_params('im_poly_scalar', e.value))
 
 # Main UI windows
+@ui.refreshable
+def export_panel():
+    global im_final, doc_buf
+
+    if im_final is not None:
+        with ui.interactive_image(im_final) as ii:
+            ui.label('35.5s').classes('absolute bottom-0 left-0 m-2 text-white p-4 bg-black backdrop-opacity-10 rounded-md')
+
+            ui.button("Download .DXF", on_click=lambda: ui.download(doc_buf, 'output.dxf'), icon='download') \
+                .props('flat fab color=blue') \
+                .classes('absolute bottom-0 right-0 m-2')
+    else:
+        with ui.column():
+            ui.markdown("#### No image processed<br>")
+            ui.markdown("You must load an image and process first before exporting.")
+
 @ui.refreshable
 def uploader_panel():
     with ui.card().classes('no-shadow border-[1px] w-full'):
@@ -188,9 +311,10 @@ def uploader_panel():
 
             with ui.row().classes('w-full'):
                 def proc_image_step():
-                    global im_cropped, topx, topy, botx, boty
+                    global im_cropped, im_thresh_s, topx, topy, botx, boty
 
                     im_cropped = loaded_rgba.crop((topx, topy, botx, boty))
+                    im_thresh_s = threshold_otsu(np.array(im_cropped.convert('L')))
                     tweak_algorithm_panel.refresh()
 
                     ui.notify('Loaded image successfully, going to next tab.', type='success')
@@ -214,28 +338,23 @@ def tweak_algorithm_panel():
     global loaded_b64, loaded_b64_type
 
     if im_cropped is not None:
-        with ui.splitter(value=15).classes('w-full h-[500px]') as splitter:
-            with splitter.before:
-                with ui.tabs().props('vertical').classes('w-full') as tabs:
-                    binar = ui.tab('Binarization', icon='opacity')
-                    lcom = ui.tab('LCOM Reduction', icon='blur_on')
-                    tvec = ui.tab('Tangency/Vectorization', icon='polyline')
-            with splitter.after:
-                with ui.tab_panels(tabs, value=binar) \
-                        .props('vertical').classes('w-full h-full'):
-                    with ui.tab_panel(binar):
-                        panel_tweak_binarization()
+        with ui.tabs() as tabs:
+            binar = ui.tab('Binarization', icon='opacity')
+            polyreg = ui.tab('Polygon Regression', icon='select_all')
 
-                    with ui.tab_panel(lcom):
-                        panel_tweak_lcom()
+        with ui.tab_panels(tabs, value=binar).classes('w-full'):
+            with ui.tab_panel(binar):
+                panel_tweak_binarization()
 
-                    with ui.tab_panel(tvec):
-                        panel_tweak_tangvec()
+            with ui.tab_panel(polyreg):
+                panel_tweak_polyreg()
 
         with ui.row().classes('w-full'):
             def proc_image_step():
                 # stuff here
                 procDxf()
+
+                export_panel.refresh()
 
                 ui.notify('Processed image successfully, going to next tab.', type='success')
                 Timer(1, lambda: panels.set_value('Export')).start()
@@ -247,9 +366,6 @@ def tweak_algorithm_panel():
         with ui.column():
             ui.markdown("#### No image loaded<br>")
             ui.markdown("You must load an image first before changing settings.")
-@ui.refreshable
-def export_panel():
-    pass
 
 # UI Elements
 dark_mode_status = 0
